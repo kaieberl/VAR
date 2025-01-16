@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import dist
+from psnr_ssim import calculate_ssim
 from utils import arg_util, misc
 from utils.data import build_dataset
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
@@ -31,36 +32,36 @@ def build_everything(args: arg_util.Args):
         # noinspection PyTypeChecker
         tb_lg = misc.DistLogger(None, verbose=False)
     dist.barrier()
-    
+
     # log args
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
-    
+
     # build data
     if not args.local_debug:
         print(f'[build PT data] ...\n')
         num_classes, dataset_train, dataset_val = build_dataset(
-            args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
+            args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=1.,
         )
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
-        
+
         ld_val = DataLoader(
             dataset_val, num_workers=0, pin_memory=True,
             batch_size=round(args.batch_size*1.5), sampler=EvalDistributedSampler(dataset_val, num_replicas=dist.get_world_size(), rank=dist.get_rank()),
             shuffle=False, drop_last=False,
         )
         del dataset_val
-        
+
         ld_train = DataLoader(
             dataset=dataset_train, num_workers=args.workers, pin_memory=True,
             generator=args.get_different_generator_for_each_rank(), # worker_init_fn=worker_init_fn,
             batch_sampler=DistInfiniteBatchSampler(
                 dataset_len=len(dataset_train), glb_batch_size=args.glb_batch_size, same_seed_for_all_ranks=args.same_seed_for_all_ranks,
-                shuffle=True, fill_last=True, rank=dist.get_rank(), world_size=dist.get_world_size(), start_ep=start_ep, start_it=start_it,
+                shuffle=False, fill_last=False, rank=dist.get_rank(), world_size=dist.get_world_size(), start_ep=start_ep, start_it=start_it,
             ),
         )
         del dataset_train
-        
+
         [print(line) for line in auto_resume_info]
         print(f'[dataloader multi processing] ...', end='', flush=True)
         stt = time.time()
@@ -69,19 +70,19 @@ def build_everything(args: arg_util.Args):
         # noinspection PyArgumentList
         print(f'     [dataloader multi processing](*) finished! ({time.time()-stt:.2f}s)', flush=True, clean=True)
         print(f'[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={iters_train}, types(tr, va)={types}')
-    
+
     else:
         num_classes = 1000
         ld_val = ld_train = None
         iters_train = 10
-    
+
     # build models
     from torch.nn.parallel import DistributedDataParallel as DDP
     from models import VAR, VQVAE, build_vae_var
     from trainer import VARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
-    
+
     vae_local, var_wo_ddp = build_vae_var(
         V=4096, Cvae=32, ch=160, share_quant_resi=4,        # hard-coded VQVAE hyperparameters
         device=dist.get_device(), patch_nums=args.patch_nums,
@@ -89,23 +90,37 @@ def build_everything(args: arg_util.Args):
         flash_if_available=args.fuse, fused_if_available=args.fuse,
         init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
     )
-    
+
     vae_ckpt = 'vae_ch160v4096z32.pth'
     if dist.is_local_master():
         if not os.path.exists(vae_ckpt):
             os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
     dist.barrier()
     vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-    
+
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
-    
+
+    del var, var_wo_ddp
+
+    import numpy as np
+    from tqdm import tqdm
+
+    ssim = []
+    with torch.no_grad():
+        for x, _ in tqdm(ld_train):
+            x_hat = vae_local(x)
+            ssim.append(calculate_ssim(x_hat, x, 0))
+    ssim = np.array(ssim)
+    np.save("ssim_train.npy", ssim)
+    import sys; sys.exit(0)
+
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters())/1e6:.2f}'
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
-    
+
     # build optimizer
     names, paras, para_groups = filter_params(var_wo_ddp, nowd_keys={
         'cls_token', 'start_token', 'task_token', 'cfg_uncond',
@@ -120,13 +135,13 @@ def build_everything(args: arg_util.Args):
     }[args.opt.lower().strip()]
     opt_kw = dict(lr=args.tlr, weight_decay=0)
     print(f'[INIT] optim={opt_clz}, opt_kw={opt_kw}\n')
-    
+
     var_optim = AmpOptimizer(
         mixed_precision=args.fp16, optimizer=opt_clz(params=para_groups, **opt_kw), names=names, paras=paras,
         grad_clip=args.tclip, n_gradient_accumulation=args.ac
     )
     del names, paras, para_groups
-    
+
     # build trainer
     trainer = VARTrainer(
         device=args.device, patch_nums=args.patch_nums, resos=args.resos,
@@ -136,14 +151,14 @@ def build_everything(args: arg_util.Args):
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
     del vae_local, var_wo_ddp, var, var_optim
-    
+
     if args.local_debug:
         rng = torch.Generator('cpu')
         rng.manual_seed(0)
         B = 4
         inp = torch.rand(B, 3, args.data_load_reso, args.data_load_reso)
         label = torch.ones(B, dtype=torch.long)
-        
+
         me = misc.MetricLogger(delimiter='  ')
         trainer.train_step(
             it=0, g_it=0, stepping=True, metric_lg=me, tb_lg=tb_lg,
@@ -155,12 +170,12 @@ def build_everything(args: arg_util.Args):
             inp_B3HW=inp, label_B=label, prog_si=-1, prog_wp_it=20,
         )
         print({k: meter.global_avg for k, meter in me.meters.items()})
-        
+
         args.dump_log(); tb_lg.flush(); tb_lg.close()
         if isinstance(sys.stdout, misc.SyncPrint) and isinstance(sys.stderr, misc.SyncPrint):
             sys.stdout.close(), sys.stderr.close()
         exit(0)
-    
+
     dist.barrier()
     return (
         tb_lg, trainer, start_ep, start_it,
